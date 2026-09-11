@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth, type TUI } from "@earendil-works/pi-tui";
+import { normalizeCodexResetAt } from "./codex-quota.js";
 
 interface TelemetryState {
   turnTokens: number;
@@ -423,9 +424,11 @@ function readQuotaWindow(snapshot: unknown, durationMinutes: number): CodexQuota
     const window = asRecord(candidate);
     if (!window || finiteNumber(window.windowDurationMins) !== durationMinutes) continue;
 
+    const usedPercent = finiteNumber(window.usedPercent);
+    const resetsAt = finiteNumber(window.resetsAt);
     return {
-      usedPercent: finiteNumber(window.usedPercent),
-      resetsAt: finiteNumber(window.resetsAt),
+      usedPercent,
+      resetsAt: normalizeCodexResetAt(usedPercent, resetsAt, durationMinutes),
     };
   }
   return undefined;
