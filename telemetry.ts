@@ -2,6 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import { normalizeCodexResetAt } from "./codex-quota.js";
+import { calculateDeepSeekUsageCost } from "./deepseek-usage.js";
 
 interface TelemetryState {
   turnTokens: number;
@@ -31,6 +32,34 @@ interface CacheUsageState {
   input?: number;
 }
 
+interface DeepSeekBalanceInfo {
+  currency: string;
+  totalBalance: number;
+  grantedBalance?: number;
+  toppedUpBalance?: number;
+  isAvailable: boolean;
+}
+
+interface DeepSeekBalanceState {
+  status: "loading" | "unavailable" | "ready";
+  info?: DeepSeekBalanceInfo;
+}
+
+interface DeepSeekUsageState {
+  requestCount: number;
+  sessionCost: number;
+  sessionCacheSaved: number;
+  sessionCacheHitTokens: number;
+  sessionCacheMissTokens: number;
+  sessionOutputTokens: number;
+  lastCost?: number;
+  lastCacheSaved?: number;
+  lastCacheHitTokens?: number;
+  lastCacheMissTokens?: number;
+  lastOutputTokens?: number;
+  lastPeak?: boolean;
+}
+
 interface JsonObject {
   [key: string]: unknown;
 }
@@ -44,11 +73,17 @@ interface ServerIdentity extends CodexIdentity {
   type?: string;
 }
 
+type TelemetryMode = "codex" | "deepseek" | "generic";
+
 const CODEX_PROVIDER = "openai-codex";
+const DEEPSEEK_PROVIDER = "deepseek";
+const DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance";
 const CODEX_FIVE_HOUR_MINUTES = 300;
 const CODEX_WEEKLY_MINUTES = 10_080;
 const CODEX_REFRESH_INTERVAL_MS = 90_000;
+const DEEPSEEK_BALANCE_REFRESH_INTERVAL_MS = 90_000;
 const CODEX_REQUEST_TIMEOUT_MS = 10_000;
+const DEEPSEEK_REQUEST_TIMEOUT_MS = 10_000;
 const CONTEXT_PANEL_WIDTH = 44;
 const CODEX_PANEL_MIN_WIDTH = 34;
 const CODEX_PANEL_MAX_WIDTH = 41;
@@ -78,6 +113,21 @@ function finiteNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+function decimalNumber(value: unknown): number | undefined {
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (typeof value !== "string" || value.trim().length === 0) return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function telemetryMode(model: unknown): TelemetryMode {
+  const record = asRecord(model);
+  const provider = nonEmptyString(record?.provider);
+  if (provider === CODEX_PROVIDER) return "codex";
+  if (provider === DEEPSEEK_PROVIDER) return "deepseek";
+  return "generic";
+}
+
 function renderRemainingQuotaBar(remainingPercent: unknown, width: number): string | undefined {
   const numericPercent = finiteNumber(remainingPercent);
   if (numericPercent === undefined) return undefined;
@@ -103,8 +153,62 @@ function eligibleCacheModelLabel(model: unknown): string | undefined {
   return modelId ? GPT_56_CACHE_MODEL_LABELS[modelId] : undefined;
 }
 
+function emptyDeepSeekUsage(): DeepSeekUsageState {
+  return {
+    requestCount: 0,
+    sessionCost: 0,
+    sessionCacheSaved: 0,
+    sessionCacheHitTokens: 0,
+    sessionCacheMissTokens: 0,
+    sessionOutputTokens: 0,
+  };
+}
+
 function toError(value: unknown): Error {
   return value instanceof Error ? value : new Error(String(value));
+}
+
+function parseDeepSeekBalance(payload: unknown): DeepSeekBalanceInfo {
+  const root = asRecord(payload);
+  if (!root) throw new Error("DeepSeek balance response was not an object");
+
+  const rawInfos = Array.isArray(root.balance_infos) ? root.balance_infos : [];
+  const infos = rawInfos.map(asRecord).filter((info): info is JsonObject => info !== undefined);
+  if (infos.length === 0) throw new Error("DeepSeek balance response did not contain balances");
+
+  const selected = infos.find((info) => nonEmptyString(info.currency)?.toUpperCase() === "USD") ?? infos[0];
+  const currency = nonEmptyString(selected.currency)?.toUpperCase();
+  const totalBalance = decimalNumber(selected.total_balance);
+  if (!currency || totalBalance === undefined) throw new Error("DeepSeek balance response was incomplete");
+
+  return {
+    currency,
+    totalBalance,
+    grantedBalance: decimalNumber(selected.granted_balance),
+    toppedUpBalance: decimalNumber(selected.topped_up_balance),
+    isAvailable: root.is_available === true,
+  };
+}
+
+async function readDeepSeekBalance(apiKey: string): Promise<DeepSeekBalanceInfo> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), DEEPSEEK_REQUEST_TIMEOUT_MS);
+  (timeout as any).unref?.();
+
+  try {
+    const response = await fetch(DEEPSEEK_BALANCE_URL, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`DeepSeek balance request failed (${response.status})`);
+    return parseDeepSeekBalance(await response.json());
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function decodeJwtPayload(token: string): JsonObject | undefined {
@@ -554,10 +658,14 @@ export default function (pi: ExtensionAPI) {
   };
 
   let codexLimits: CodexLimitsState = { status: "loading" };
+  let deepSeekBalance: DeepSeekBalanceState = { status: "loading" };
+  let deepSeekUsage = emptyDeepSeekUsage();
   let codexClient: CodexAppServerClient | undefined;
   let codexRefreshTimer: ReturnType<typeof setInterval> | undefined;
+  let deepSeekBalanceRefreshTimer: ReturnType<typeof setInterval> | undefined;
   let cacheRefreshTimer: ReturnType<typeof setInterval> | undefined;
   let codexRefreshInFlight = false;
+  let deepSeekBalanceRefreshInFlight = false;
   let sessionActive = false;
   let lastEligibleRequestStartedAt: number | undefined;
   let cacheGuaranteedUntil: number | undefined;
@@ -601,6 +709,9 @@ export default function (pi: ExtensionAPI) {
     const tokens = usage?.tokens ?? 0;
     const contextWindow = ctx.model?.contextWindow ?? 128_000;
     const pct = contextWindow > 0 ? Math.max(0, Math.min(100, Math.round((tokens / contextWindow) * 100))) : 0;
+    const deepSeekSelected = telemetryMode(ctx.model) === "deepseek";
+    const turnCost = deepSeekSelected ? (deepSeekUsage.lastCost ?? 0) : state.turnCost;
+    const totalCost = deepSeekSelected ? deepSeekUsage.sessionCost : state.totalCost;
 
     const bar = drawBar(pct);
     const pctStr = String(pct).padStart(3);
@@ -611,7 +722,7 @@ export default function (pi: ExtensionAPI) {
       panelContent(safeWidth, `${bar} ${pctStr}% (${fmtTokens(tokens)}/${fmtTokens(contextWindow)})`),
       panelContent(
         safeWidth,
-        `turn: ${fmtCost(state.turnCost)}  total: ${fmtCost(state.totalCost)}  ${state.velocity > 0 ? `${state.velocity} tok/s` : "— tok/s"}`,
+        `turn: ${fmtCost(turnCost)}  total: ${fmtCost(totalCost)}  ${state.velocity > 0 ? `${state.velocity} tok/s` : "— tok/s"}`,
       ),
       panelContent(safeWidth, `${state.messageCount} msgs  stream: ${fmtDuration(state.streamDurationMs)}`),
       panelBottom(safeWidth),
@@ -813,9 +924,101 @@ export default function (pi: ExtensionAPI) {
     ];
   }
 
+  function formatDeepSeekBalance(info: DeepSeekBalanceInfo | undefined): string {
+    if (!info) return "—";
+    const amount = info.totalBalance.toFixed(2);
+    if (info.currency === "USD") return `$${amount}`;
+    if (info.currency === "CNY") return `¥${amount}`;
+    return `${amount} ${info.currency}`;
+  }
+
+  function formatDeepSeekUsagePanelLines(panelWidth: number): string[] {
+    const safeWidth = Math.max(2, Math.floor(panelWidth));
+    const balance =
+      deepSeekBalance.status === "loading"
+        ? "balance …"
+        : deepSeekBalance.status === "unavailable"
+          ? "balance unavailable"
+          : `balance ${formatDeepSeekBalance(deepSeekBalance.info)}`;
+    const sessionTokens =
+      deepSeekUsage.sessionCacheHitTokens + deepSeekUsage.sessionCacheMissTokens + deepSeekUsage.sessionOutputTokens;
+    const sessionLine = `session ${fmtCost(deepSeekUsage.sessionCost)} · ${fmtTokens(sessionTokens)} tok`;
+    const turnMode = deepSeekUsage.lastPeak === undefined ? "" : deepSeekUsage.lastPeak ? " · peak" : " · off";
+    const turnLine = `turn ${fmtCost(deepSeekUsage.lastCost ?? 0)} · ${deepSeekUsage.requestCount} req${turnMode}`;
+
+    return [
+      panelTop(safeWidth, " DeepSeek Usage "),
+      panelContent(safeWidth, balance),
+      panelContent(safeWidth, sessionLine),
+      panelContent(safeWidth, turnLine),
+      panelBottom(safeWidth),
+    ];
+  }
+
+  function formatHitRate(hitTokens: number | undefined, missTokens: number | undefined): string {
+    if (hitTokens === undefined || missTokens === undefined) return "—";
+    const total = hitTokens + missTokens;
+    if (total <= 0) return "—";
+    return `${Math.round((hitTokens / total) * 100)}%`;
+  }
+
+  function formatDeepSeekCachePanelLines(panelWidth: number): string[] {
+    const safeWidth = Math.max(2, Math.floor(panelWidth));
+    const lastHit = deepSeekUsage.lastCacheHitTokens;
+    const lastMiss = deepSeekUsage.lastCacheMissTokens;
+    const lastTotal = (lastHit ?? 0) + (lastMiss ?? 0);
+    const status = lastTotal <= 0 ? "—" : (lastHit ?? 0) > 0 ? "HIT" : "MISS";
+    const lastLine = `${status} ${formatHitRate(lastHit, lastMiss)} · H${formatCacheTokens(lastHit)} M${formatCacheTokens(lastMiss)}`;
+    const sessionRate = formatHitRate(deepSeekUsage.sessionCacheHitTokens, deepSeekUsage.sessionCacheMissTokens);
+    const sessionLine = `session ${sessionRate} · H${formatCacheTokens(deepSeekUsage.sessionCacheHitTokens)} M${formatCacheTokens(deepSeekUsage.sessionCacheMissTokens)}`;
+    const savedLine = `saved ${fmtCost(deepSeekUsage.sessionCacheSaved)}`;
+
+    return [
+      panelTop(safeWidth, " DeepSeek Cache "),
+      panelContent(safeWidth, lastLine),
+      panelContent(safeWidth, sessionLine),
+      panelContent(safeWidth, savedLine),
+      panelBottom(safeWidth),
+    ];
+  }
+
   function formatTelemetryLines(ctx: any): string[] {
     // Keep the original string-array widget path for RPC/print modes.
     return formatContextPanelLines(ctx, CONTEXT_PANEL_WIDTH);
+  }
+
+  function renderThreePanelLayout(
+    ctx: any,
+    contentWidth: number,
+    middlePanel: (width: number) => string[],
+    rightPanel: (width: number) => string[],
+  ): string[] {
+    if (contentWidth >= THREE_PANEL_MIN_WIDTH) {
+      const [contextPanelWidth, middlePanelWidth, rightPanelWidth] = splitEqualPanelWidths(contentWidth);
+      return joinPanels(
+        joinPanels(formatContextPanelLines(ctx, contextPanelWidth), middlePanel(middlePanelWidth)),
+        rightPanel(rightPanelWidth),
+      );
+    }
+
+    if (contentWidth >= SIDE_BY_SIDE_WIDTH) {
+      const middlePanelWidth = Math.min(
+        CODEX_PANEL_MAX_WIDTH,
+        Math.max(CODEX_PANEL_MIN_WIDTH, contentWidth - CONTEXT_PANEL_WIDTH + 1),
+      );
+      return [
+        ...joinPanels(formatContextPanelLines(ctx, CONTEXT_PANEL_WIDTH), middlePanel(middlePanelWidth)),
+        ...rightPanel(contentWidth),
+      ];
+    }
+
+    const contextWidth = Math.min(CONTEXT_PANEL_WIDTH, Math.max(2, contentWidth));
+    const middleWidth = Math.min(CODEX_PANEL_MAX_WIDTH, Math.max(2, contentWidth));
+    return [
+      ...formatContextPanelLines(ctx, contextWidth),
+      ...middlePanel(middleWidth),
+      ...rightPanel(contentWidth),
+    ];
   }
 
   function renderTelemetryWidgetLines(ctx: any, width: number, countdownColon = ":"): string[] {
@@ -823,36 +1026,21 @@ export default function (pi: ExtensionAPI) {
     if (safeWidth <= 2) return [truncateToWidth("…", safeWidth, "")];
 
     const contentWidth = safeWidth - 2; // Match the existing string widget's one-column margins.
+    const mode = telemetryMode(ctx.model);
     let lines: string[];
-    if (contentWidth >= THREE_PANEL_MIN_WIDTH) {
-      const [contextPanelWidth, codexPanelWidth, cachePanelWidth] = splitEqualPanelWidths(contentWidth);
-      lines = joinPanels(
-        joinPanels(
-          formatContextPanelLines(ctx, contextPanelWidth),
-          formatCodexPanelLines(codexPanelWidth, countdownColon),
-        ),
-        formatCachePanelLines(cachePanelWidth),
+
+    if (mode === "codex") {
+      lines = renderThreePanelLayout(
+        ctx,
+        contentWidth,
+        (panelWidth) => formatCodexPanelLines(panelWidth, countdownColon),
+        formatCachePanelLines,
       );
-    } else if (contentWidth >= SIDE_BY_SIDE_WIDTH) {
-      const codexPanelWidth = Math.min(
-        CODEX_PANEL_MAX_WIDTH,
-        Math.max(CODEX_PANEL_MIN_WIDTH, contentWidth - CONTEXT_PANEL_WIDTH + 1),
-      );
-      lines = [
-        ...joinPanels(
-          formatContextPanelLines(ctx, CONTEXT_PANEL_WIDTH),
-          formatCodexPanelLines(codexPanelWidth, countdownColon),
-        ),
-        ...formatCachePanelLines(contentWidth),
-      ];
+    } else if (mode === "deepseek") {
+      lines = renderThreePanelLayout(ctx, contentWidth, formatDeepSeekUsagePanelLines, formatDeepSeekCachePanelLines);
     } else {
       const contextWidth = Math.min(CONTEXT_PANEL_WIDTH, Math.max(2, contentWidth));
-      const codexWidth = Math.min(CODEX_PANEL_MAX_WIDTH, Math.max(2, contentWidth));
-      lines = [
-        ...formatContextPanelLines(ctx, contextWidth),
-        ...formatCodexPanelLines(codexWidth, countdownColon),
-        ...formatCachePanelLines(contentWidth),
-      ];
+      lines = formatContextPanelLines(ctx, contextWidth);
     }
 
     return lines.map((line) => {
@@ -898,6 +1086,23 @@ export default function (pi: ExtensionAPI) {
     updateTelemetry(ctx);
   }
 
+  function deepSeekBalanceEqual(left: DeepSeekBalanceState, right: DeepSeekBalanceState): boolean {
+    return (
+      left.status === right.status &&
+      left.info?.currency === right.info?.currency &&
+      left.info?.totalBalance === right.info?.totalBalance &&
+      left.info?.grantedBalance === right.info?.grantedBalance &&
+      left.info?.toppedUpBalance === right.info?.toppedUpBalance &&
+      left.info?.isAvailable === right.info?.isAvailable
+    );
+  }
+
+  function setDeepSeekBalance(next: DeepSeekBalanceState, ctx: any): void {
+    if (deepSeekBalanceEqual(deepSeekBalance, next)) return;
+    deepSeekBalance = next;
+    if (telemetryMode(ctx.model) === "deepseek") updateTelemetry(ctx);
+  }
+
   async function getPiCodexIdentity(ctx: any): Promise<CodexIdentity> {
     try {
       const authResult = await ctx.modelRegistry.getProviderAuth(CODEX_PROVIDER);
@@ -906,6 +1111,16 @@ export default function (pi: ExtensionAPI) {
       return getCodexIdentityFromAccessToken(accessToken.replace(/^Bearer\s+/i, ""));
     } catch {
       return {};
+    }
+  }
+
+  async function getDeepSeekApiKey(ctx: any): Promise<string | undefined> {
+    try {
+      const authResult = await ctx.modelRegistry.getProviderAuth(DEEPSEEK_PROVIDER);
+      const apiKey = nonEmptyString(authResult?.auth?.apiKey);
+      return apiKey?.replace(/^Bearer\s+/i, "");
+    } catch {
+      return undefined;
     }
   }
 
@@ -935,8 +1150,32 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  async function refreshDeepSeekBalance(ctx: any): Promise<void> {
+    if (!sessionActive || ctx.mode !== "tui" || telemetryMode(ctx.model) !== "deepseek" || deepSeekBalanceRefreshInFlight) {
+      return;
+    }
+
+    deepSeekBalanceRefreshInFlight = true;
+    try {
+      const apiKey = await getDeepSeekApiKey(ctx);
+      if (!apiKey) throw new Error("DeepSeek API key unavailable");
+      const info = await readDeepSeekBalance(apiKey);
+      if (!sessionActive || telemetryMode(ctx.model) !== "deepseek") return;
+      setDeepSeekBalance({ status: "ready", info }, ctx);
+    } catch {
+      if (!sessionActive || telemetryMode(ctx.model) !== "deepseek") return;
+      setDeepSeekBalance({ status: "unavailable" }, ctx);
+    } finally {
+      deepSeekBalanceRefreshInFlight = false;
+    }
+  }
+
   pi.on("model_select", async (_event, ctx) => {
+    const mode = telemetryMode(ctx.model);
     updateTelemetry(ctx);
+    if (ctx.mode !== "tui") return;
+    if (mode === "deepseek") void refreshDeepSeekBalance(ctx);
+    else if (mode === "codex") void refreshCodexLimits(ctx);
   });
 
   pi.on("session_start", async (_event, ctx) => {
@@ -951,6 +1190,8 @@ export default function (pi: ExtensionAPI) {
       turnStart: Date.now(),
     };
     codexLimits = { status: "loading" };
+    deepSeekBalance = { status: "loading" };
+    deepSeekUsage = emptyDeepSeekUsage();
     sessionActive = true;
     lastEligibleRequestStartedAt = undefined;
     cacheGuaranteedUntil = undefined;
@@ -965,6 +1206,8 @@ export default function (pi: ExtensionAPI) {
 
     if (codexRefreshTimer) clearInterval(codexRefreshTimer);
     codexRefreshTimer = undefined;
+    if (deepSeekBalanceRefreshTimer) clearInterval(deepSeekBalanceRefreshTimer);
+    deepSeekBalanceRefreshTimer = undefined;
     if (cacheRefreshTimer) clearInterval(cacheRefreshTimer);
     cacheRefreshTimer = setInterval(() => {
       if (sessionActive) telemetryWidgetTui?.requestRender();
@@ -987,11 +1230,24 @@ export default function (pi: ExtensionAPI) {
     }, CODEX_REFRESH_INTERVAL_MS);
     (codexRefreshTimer as any).unref?.();
 
+    deepSeekBalanceRefreshTimer = setInterval(() => {
+      if (sessionActive && latestContext && telemetryMode(latestContext.model) === "deepseek") {
+        void refreshDeepSeekBalance(latestContext);
+      }
+    }, DEEPSEEK_BALANCE_REFRESH_INTERVAL_MS);
+    (deepSeekBalanceRefreshTimer as any).unref?.();
+
     void refreshCodexLimits(ctx);
+    if (telemetryMode(ctx.model) === "deepseek") void refreshDeepSeekBalance(ctx);
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
-    if (ctx.mode === "tui") void refreshCodexLimits(ctx);
+    if (ctx.mode !== "tui") return;
+    if (telemetryMode(ctx.model) === "deepseek") {
+      void refreshDeepSeekBalance(ctx);
+    } else {
+      void refreshCodexLimits(ctx);
+    }
   });
 
   pi.on("message_end", async (event, ctx) => {
@@ -1000,7 +1256,8 @@ export default function (pi: ExtensionAPI) {
     state.messageCount++;
 
     const msg = event.message as any;
-    if (pendingEligibleRequest && msg.stopReason !== "error" && msg.stopReason !== "aborted") {
+    const successful = msg.stopReason !== "error" && msg.stopReason !== "aborted";
+    if (pendingEligibleRequest && successful) {
       lastEligibleRequestStartedAt = pendingEligibleRequest.startedAt;
       cacheGuaranteedUntil = lastEligibleRequestStartedAt + CACHE_GUARANTEED_WINDOW_MS;
       lastEligibleModelLabel = pendingEligibleRequest.modelLabel;
@@ -1009,7 +1266,7 @@ export default function (pi: ExtensionAPI) {
 
     const usage = msg.usage;
     if (usage) {
-      if (msg.stopReason !== "error" && msg.stopReason !== "aborted") {
+      if (successful) {
         const cacheRead = finiteNumber(usage.cacheRead);
         const cacheWrite = finiteNumber(usage.cacheWrite);
         if (cacheRead !== undefined && cacheWrite !== undefined) {
@@ -1023,12 +1280,42 @@ export default function (pi: ExtensionAPI) {
 
       // Standard Usage interface uses "output", not "outputTokens".
       // Some providers may use snake_case output_tokens as a fallback.
-      const outputTokens = usage.output ?? usage.output_tokens ?? 0;
+      const outputTokens = finiteNumber(usage.output ?? usage.output_tokens) ?? 0;
       state.turnTokens += outputTokens;
-      const msgCost = usage.cost?.total ?? 0;
+      const msgCost = finiteNumber(usage.cost?.total) ?? 0;
       state.turnCost += msgCost;
       if (msgCost) {
         state.totalCost += msgCost;
+      }
+
+      if (successful) {
+        const messageProvider = firstString(msg.provider, asRecord(ctx.model)?.provider);
+        const modelId = firstString(msg.model, asRecord(ctx.model)?.id);
+        if (messageProvider === DEEPSEEK_PROVIDER && modelId) {
+          const calculated = calculateDeepSeekUsageCost(
+            modelId,
+            {
+              cacheHitTokens: finiteNumber(usage.cacheRead) ?? 0,
+              cacheMissTokens: finiteNumber(usage.input) ?? 0,
+              outputTokens,
+            },
+            finiteNumber(msg.timestamp) ?? Date.now(),
+          );
+          if (calculated) {
+            deepSeekUsage.requestCount += 1;
+            deepSeekUsage.sessionCost += calculated.cost;
+            deepSeekUsage.sessionCacheSaved += calculated.cacheSaved;
+            deepSeekUsage.sessionCacheHitTokens += calculated.cacheHitTokens;
+            deepSeekUsage.sessionCacheMissTokens += calculated.cacheMissTokens;
+            deepSeekUsage.sessionOutputTokens += calculated.outputTokens;
+            deepSeekUsage.lastCost = calculated.cost;
+            deepSeekUsage.lastCacheSaved = calculated.cacheSaved;
+            deepSeekUsage.lastCacheHitTokens = calculated.cacheHitTokens;
+            deepSeekUsage.lastCacheMissTokens = calculated.cacheMissTokens;
+            deepSeekUsage.lastOutputTokens = calculated.outputTokens;
+            deepSeekUsage.lastPeak = calculated.peak;
+          }
+        }
       }
 
       // Calculate velocity (tok/s) based on the current turn's accumulated output.
@@ -1064,19 +1351,31 @@ export default function (pi: ExtensionAPI) {
     state.velocity = 0;
     state.streamDurationMs = 0;
 
+    if (telemetryMode(ctx.model) === "deepseek") {
+      deepSeekUsage.lastCost = undefined;
+      deepSeekUsage.lastCacheSaved = undefined;
+      deepSeekUsage.lastCacheHitTokens = undefined;
+      deepSeekUsage.lastCacheMissTokens = undefined;
+      deepSeekUsage.lastOutputTokens = undefined;
+      deepSeekUsage.lastPeak = undefined;
+    }
+
     const usage = ctx.getContextUsage?.();
     const tokens = usage?.tokens ?? 0;
     const contextWindow = ctx.model?.contextWindow ?? 128_000;
     const pct = contextWindow > 0 ? Math.round((tokens / contextWindow) * 100) : 0;
 
     const icon = pct >= 80 ? "🔴" : pct >= 60 ? "🟡" : "🟢";
-    ctx.ui.setStatus("telemetry", `${icon} ${pct}% · $${state.totalCost.toFixed(4)}`);
+    const displayedTotalCost = telemetryMode(ctx.model) === "deepseek" ? deepSeekUsage.sessionCost : state.totalCost;
+    ctx.ui.setStatus("telemetry", `${icon} ${pct}% · $${displayedTotalCost.toFixed(4)}`);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
     sessionActive = false;
     if (codexRefreshTimer) clearInterval(codexRefreshTimer);
     codexRefreshTimer = undefined;
+    if (deepSeekBalanceRefreshTimer) clearInterval(deepSeekBalanceRefreshTimer);
+    deepSeekBalanceRefreshTimer = undefined;
     if (cacheRefreshTimer) clearInterval(cacheRefreshTimer);
     cacheRefreshTimer = undefined;
 
