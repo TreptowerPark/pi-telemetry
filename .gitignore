@@ -1,0 +1,12 @@
+# Local/package artifacts
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+.DS_Store
+
+# This checkout lives beside other local Pi extensions. Keep this repository focused.
+block-copy.ts
+opencode-go-qwen-cache-fix.ts
+workflow-modes.ts
+pi-fast-explorer/

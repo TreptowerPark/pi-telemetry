@@ -1,0 +1,28 @@
+{
+  "name": "pi-telemetry",
+  "version": "1.0.0",
+  "description": "Pi TUI telemetry for context usage, Codex limits, and prompt-cache timing.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "telemetry",
+    "codex",
+    "prompt-cache"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TreptowPark/pi-telemetry.git"
+  },
+  "bugs": {
+    "url": "https://github.com/TreptowPark/pi-telemetry/issues"
+  },
+  "pi": {
+    "extensions": ["./telemetry.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}
