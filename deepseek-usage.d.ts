@@ -23,7 +23,7 @@ export interface DeepSeekUsageCost {
   cacheSaved: number;
 }
 
-export function getDeepSeekPricingFamily(modelId: string): DeepSeekPricingFamily | undefined;
+export function getDeepSeekPricingFamily(modelId: string, timestampMs?: number): DeepSeekPricingFamily | undefined;
 export function isDeepSeekPeakAt(timestampMs?: number): boolean;
 export function calculateDeepSeekUsageCost(
   modelId: string,
