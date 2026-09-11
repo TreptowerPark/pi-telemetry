@@ -3,6 +3,10 @@
   "version": "1.0.0",
   "description": "Pi TUI telemetry for context usage, Codex limits, and prompt-cache timing.",
   "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test tests/codex-quota.test.js"
+  },
   "keywords": [
     "pi-package",
     "pi",
@@ -13,10 +17,10 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/TreptowPark/pi-telemetry.git"
+    "url": "https://github.com/TreptowerPark/pi-telemetry.git"
   },
   "bugs": {
-    "url": "https://github.com/TreptowPark/pi-telemetry/issues"
+    "url": "https://github.com/TreptowerPark/pi-telemetry/issues"
   },
   "pi": {
     "extensions": ["./telemetry.ts"]
